@@ -1,6 +1,7 @@
 import asyncio
 import csv
 import sys
+from collections import deque
 import time
 from pathlib import Path
 
@@ -60,6 +61,85 @@ class Flappy:
                 writer.writerow(["episode", "total_reward", "average_loss", "epsilon"])
         self.print_interval = 10
 
+    async def start(
+        self,
+        *,
+        mode="train",
+        episodes=None,
+        save_best_model_path=None,
+        best_average_window=10,
+        model_path=None,
+        evaluation_episodes=None,
+    ):
+        if mode == "train":
+            total_episodes = episodes or self.num_episodes
+            await self._train_loop(
+                episodes=total_episodes,
+                save_best_model_path=save_best_model_path,
+                best_average_window=best_average_window,
+            )
+        elif mode == "evaluate":
+            total_episodes = evaluation_episodes or episodes or 1
+            await self._evaluate_loop(episodes=total_episodes, model_path=model_path)
+        else:
+            raise ValueError(f"Unsupported mode: {mode}")
+
+    def reset_scene(self):
+        self.background = Background(self.config)
+        self.floor = Floor(self.config)
+        self.player = Player(self.config)
+        self.welcome_message = WelcomeMessage(self.config)
+        self.game_over_message = GameOver(self.config)
+        self.pipes = Pipes(self.config)
+        self.score = Score(self.config)
+
+    async def _train_loop(self, episodes, save_best_model_path=None, best_average_window=10):
+        reward_window = deque(maxlen=best_average_window) if best_average_window else None
+        best_metric = float("-inf")
+
+        for episode in range(1, episodes + 1):
+            episode_reward = await self._run_episode(training=True)
+            if reward_window is not None:
+                reward_window.append(episode_reward)
+                metric = sum(reward_window) / len(reward_window)
+            else:
+                metric = episode_reward
+
+            if save_best_model_path and metric > best_metric:
+                self.agent.save_model(save_best_model_path)
+                best_metric = metric
+
+            print(f"Episode {episode}: reward={episode_reward:.2f}, metric={metric:.2f}")
+
+    async def _evaluate_loop(self, episodes, model_path=None):
+        if model_path:
+            self.agent.load_model(model_path, load_optimizer=False)
+        previous_epsilon = self.agent.epsilon
+        self.agent.epsilon = 0.0
+
+        for episode in range(1, episodes + 1):
+            self.reset_scene()
+            print(f"Evaluation episode {episode}")
+            await self.play(ai_controlled=True)
+
+        self.agent.epsilon = previous_epsilon
+
+    async def _run_episode(self, training=True):
+        self.reset_scene()
+        self.score.reset()
+        self.player.set_mode(PlayerMode.NORMAL)
+        done = False
+        observation = self.closest_entity()
+        total_reward = 0.0
+        flap_cooldown = 15
+        flap_counter = 0
+
+        while not done:
+            action = 0
+            pipe_distance = observation[2] if len(observation) > 2 else 1
+            if flap_counter == 0:
+                action = self.select_action(observation, exploit=not training)
+                if action:
     async def start(self):
         recent_rewards = []
         for episode in range(1, self.num_episodes + 1):
@@ -99,6 +179,38 @@ class Flappy:
             else:
                 flap_counter -= 1
 
+            crossed = False
+            for pipe in self.pipes.upper:
+                if self.player.crossed(pipe):
+                    crossed = True
+                    self.score.add()
+                    break
+
+            next_state = self.closest_entity()
+            done = self.player.collided(self.pipes, self.floor)
+
+            distance = max(abs(pipe_distance), 1)
+            step_reward = 0.0
+            if crossed:
+                step_reward += 100
+
+            if self.pipes.upper and self.pipes.lower:
+                upper_pipe = self.pipes.upper[0]
+                lower_pipe = self.pipes.lower[0]
+                if self.player.y > upper_pipe.rect.bottom or self.player.y < lower_pipe.rect.top:
+                    step_reward -= 50 / distance
+                else:
+                    step_reward += 50 / distance
+
+            if done:
+                step_reward -= 100
+
+            total_reward += step_reward
+
+            if training:
+                self.agent.store_transition(observation, action, step_reward, next_state, done)
+                self.agent.learn()
+
             crossed = any(self.player.crossed(pipe) for pipe in self.pipes.upper)
             if crossed:
                 self.score.add()
@@ -135,7 +247,9 @@ class Flappy:
             pygame.display.update()
             await asyncio.sleep(0)
             self.config.tick()
-        average_loss = total_loss / loss_updates if loss_updates else 0.0
+
+
+            average_loss = total_loss / loss_updates if loss_updates else 0.0
         return total_reward, average_loss
 
     async def splash(self):
@@ -173,7 +287,7 @@ class Flappy:
         screen_tap = event.type == pygame.FINGERDOWN
         return m_left or space_or_up or screen_tap
 
-    async def play(self):
+    async def play(self, ai_controlled=False):
         self.score.reset()
         self.player.set_mode(PlayerMode.NORMAL)
 
@@ -181,13 +295,19 @@ class Flappy:
             if self.player.collided(self.pipes, self.floor):
                 return
 
-            for i, pipe in enumerate(self.pipes.upper):
+            for pipe in self.pipes.upper:
                 if self.player.crossed(pipe):
                     self.score.add()
+                    break
 
             for event in pygame.event.get():
                 self.check_quit_event(event)
-                if self.is_tap_event(event):
+                if not ai_controlled and self.is_tap_event(event):
+                    self.player.flap()
+
+            if ai_controlled:
+                observation = self.closest_entity()
+                if self.select_action(observation, exploit=True):
                     self.player.flap()
 
             self.background.tick()
@@ -223,7 +343,6 @@ class Flappy:
 
             self.config.tick()
             pygame.display.update()
-            await asyncio.sleep(0)
 
     def closest_entity(self):
         # Assuming screen width as screen_width
@@ -246,21 +365,14 @@ class Flappy:
             nearest_lower_pipe = self.pipes.lower[0]
             nearest_entity_y_lower_top = nearest_lower_pipe.rect.top
 
-        # Calculate the distance to the floor
-        # distance_to_floor = self.config.window.height - player.rect.y - player.rect.height / 2
-
         state = [
             player.rect.y - nearest_entity_y_upper_bottom,
-            # Vertical distance from the player to the nearest upper pipe
-            player.rect.y - nearest_entity_y_lower_top,  # Vertical distance from the player to the nearest lower pipe
-            nearest_pipe_x - player.rect.x,  # Horizontal distance from the player to the nearest pipe
-            # distance_to_floor,  # Distance from the player to the floor
-
-            # player.vel_y  # Player's vertical velocity
+            player.rect.y - nearest_entity_y_lower_top,
+            nearest_pipe_x - player.rect.x,
         ]
         return state
 
-    def select_action(self, observation):
+    def select_action(self, observation, exploit=False):
         state_tensor = torch.tensor(observation, dtype=torch.float32).to(self.agent.Q_eval.device)
         return self.agent.choose_action(state_tensor)
 
