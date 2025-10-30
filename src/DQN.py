@@ -1,8 +1,10 @@
+from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
-import numpy as np
+import torch.optim as optim
 
 
 class DeepQNetwork(nn.Module):
@@ -45,6 +47,29 @@ class Agent():
         self.action_memory = np.zeros(self.mem_size, dtype=np.int32)
         self.reward_memory = np.zeros(self.mem_size, dtype=np.float32)
         self.terminal_memory = np.zeros(self.mem_size, dtype=np.bool_)
+
+    def save_model(self, path):
+        """Persist the current network and optimiser state to ``path``."""
+        checkpoint_path = Path(path)
+        if checkpoint_path.parent:
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "model_state_dict": self.Q_eval.state_dict(),
+            "optimizer_state_dict": self.Q_eval.optimizer.state_dict(),
+            "epsilon": self.epsilon,
+        }, checkpoint_path)
+
+    def load_model(self, path, load_optimizer=True):
+        """Load network (and optionally optimiser) state from ``path``."""
+        checkpoint = torch.load(path, map_location=self.Q_eval.device)
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            self.Q_eval.load_state_dict(checkpoint["model_state_dict"])
+            if load_optimizer and "optimizer_state_dict" in checkpoint:
+                self.Q_eval.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            if "epsilon" in checkpoint:
+                self.epsilon = checkpoint["epsilon"]
+        else:
+            self.Q_eval.load_state_dict(checkpoint)
 
     def store_transition(self, state, action, reward, state_, done):
         index = self.mem_cntr % self.mem_size
