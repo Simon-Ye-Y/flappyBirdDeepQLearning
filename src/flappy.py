@@ -2,14 +2,12 @@ import asyncio
 import csv
 import sys
 from collections import deque
-import time
 from pathlib import Path
 
+import numpy as np
 import pygame
 import torch
 from pygame.locals import K_ESCAPE, K_SPACE, K_UP, KEYDOWN, QUIT
-
-import numpy as np
 
 from .entities import (
     Background,
@@ -22,7 +20,7 @@ from .entities import (
     WelcomeMessage,
 )
 from .utils import GameConfig, Images, Sounds, Window
-from FlapPyBird.src.DQN import Agent
+from .DQN import Agent
 
 
 class Flappy:
@@ -96,9 +94,11 @@ class Flappy:
     async def _train_loop(self, episodes, save_best_model_path=None, best_average_window=10):
         reward_window = deque(maxlen=best_average_window) if best_average_window else None
         best_metric = float("-inf")
+        recent_rewards = []
 
         for episode in range(1, episodes + 1):
-            episode_reward = await self._run_episode(training=True)
+            episode_reward, average_loss = await self._run_episode(training=True)
+
             if reward_window is not None:
                 reward_window.append(episode_reward)
                 metric = sum(reward_window) / len(reward_window)
@@ -109,7 +109,21 @@ class Flappy:
                 self.agent.save_model(save_best_model_path)
                 best_metric = metric
 
-            print(f"Episode {episode}: reward={episode_reward:.2f}, metric={metric:.2f}")
+            self._log_episode(episode, episode_reward, average_loss)
+            recent_rewards.append(episode_reward)
+
+            if episode % self.print_interval == 0:
+                window = recent_rewards[-self.print_interval:]
+                avg_reward = sum(window) / len(window)
+                print(
+                    f"Episode {episode}: average reward {avg_reward:.2f}, "
+                    f"epsilon {self.agent.epsilon:.3f}"
+                )
+
+            print(
+                f"Episode {episode}: reward={episode_reward:.2f}, "
+                f"metric={metric:.2f}, loss={average_loss:.4f}"
+            )
 
     async def _evaluate_loop(self, episodes, model_path=None):
         if model_path:
@@ -128,43 +142,15 @@ class Flappy:
         self.reset_scene()
         self.score.reset()
         self.player.set_mode(PlayerMode.NORMAL)
-        done = False
-        observation = self.closest_entity()
-        total_reward = 0.0
-        flap_cooldown = 15
-        flap_counter = 0
 
-        while not done:
-            action = 0
-            pipe_distance = observation[2] if len(observation) > 2 else 1
-            if flap_counter == 0:
-                action = self.select_action(observation, exploit=not training)
-                if action:
-    async def start(self):
-        recent_rewards = []
-        for episode in range(1, self.num_episodes + 1):
-            self._reset_game()
-            total_reward, average_loss = await self.train()
-            self._log_episode(episode, total_reward, average_loss)
-            recent_rewards.append(total_reward)
-            if episode % self.print_interval == 0:
-                window = recent_rewards[-self.print_interval:]
-                avg_reward = sum(window) / len(window)
-                print(
-                    f"Episode {episode}: average reward {avg_reward:.2f}, "
-                    f"epsilon {self.agent.epsilon:.3f}"
-                )
-
-    async def train(self):
-        self.score.reset()
-        self.player.set_mode(PlayerMode.NORMAL)
         done = False
         observation = np.array(self.closest_entity(), dtype=np.float32)
         total_reward = 0.0
         total_loss = 0.0
         loss_updates = 0
-        flap_cooldown = 15  # 设置一个冷却时间，例如10帧
-        flap_counter = 0  # 初始化冷却计数器
+        flap_cooldown = 15
+        flap_counter = 0
+
         while not done:
             for event in pygame.event.get():
                 self.check_quit_event(event)
@@ -172,44 +158,12 @@ class Flappy:
             action = 0
             pipe_distance = max(abs(float(observation[2])), 1.0)
             if flap_counter == 0:
-                action = self.select_action(observation)
-                if action == 1:  # 如果选择跳跃
+                action = self.select_action(observation, exploit=not training)
+                if action == 1:
                     self.player.flap()
                     flap_counter = flap_cooldown
             else:
                 flap_counter -= 1
-
-            crossed = False
-            for pipe in self.pipes.upper:
-                if self.player.crossed(pipe):
-                    crossed = True
-                    self.score.add()
-                    break
-
-            next_state = self.closest_entity()
-            done = self.player.collided(self.pipes, self.floor)
-
-            distance = max(abs(pipe_distance), 1)
-            step_reward = 0.0
-            if crossed:
-                step_reward += 100
-
-            if self.pipes.upper and self.pipes.lower:
-                upper_pipe = self.pipes.upper[0]
-                lower_pipe = self.pipes.lower[0]
-                if self.player.y > upper_pipe.rect.bottom or self.player.y < lower_pipe.rect.top:
-                    step_reward -= 50 / distance
-                else:
-                    step_reward += 50 / distance
-
-            if done:
-                step_reward -= 100
-
-            total_reward += step_reward
-
-            if training:
-                self.agent.store_transition(observation, action, step_reward, next_state, done)
-                self.agent.learn()
 
             crossed = any(self.player.crossed(pipe) for pipe in self.pipes.upper)
             if crossed:
@@ -230,11 +184,13 @@ class Flappy:
                 step_reward -= 100.0
 
             total_reward += step_reward
-            self.agent.store_transition(observation, action, step_reward, next_state, done)
-            loss = self.agent.learn()
-            if loss is not None:
-                total_loss += loss
-                loss_updates += 1
+
+            if training:
+                self.agent.store_transition(observation, action, step_reward, next_state, done)
+                loss = self.agent.learn()
+                if loss is not None:
+                    total_loss += loss
+                    loss_updates += 1
 
             observation = next_state
 
@@ -248,8 +204,7 @@ class Flappy:
             await asyncio.sleep(0)
             self.config.tick()
 
-
-            average_loss = total_loss / loss_updates if loss_updates else 0.0
+        average_loss = total_loss / loss_updates if loss_updates else 0.0
         return total_reward, average_loss
 
     async def splash(self):
@@ -374,16 +329,13 @@ class Flappy:
 
     def select_action(self, observation, exploit=False):
         state_tensor = torch.tensor(observation, dtype=torch.float32).to(self.agent.Q_eval.device)
+        if exploit:
+            with torch.no_grad():
+                if state_tensor.dim() == 1:
+                    state_tensor = state_tensor.unsqueeze(0)
+                actions = self.agent.Q_eval(state_tensor)
+                return int(torch.argmax(actions, dim=1).item())
         return self.agent.choose_action(state_tensor)
-
-    def _reset_game(self):
-        self.background = Background(self.config)
-        self.floor = Floor(self.config)
-        self.player = Player(self.config)
-        self.welcome_message = WelcomeMessage(self.config)
-        self.game_over_message = GameOver(self.config)
-        self.pipes = Pipes(self.config)
-        self.score = Score(self.config)
 
     def _log_episode(self, episode, total_reward, average_loss):
         with self.log_file.open("a", newline="") as log_file:
