@@ -1,10 +1,14 @@
 import asyncio
+import csv
 import sys
 import time
+from pathlib import Path
 
 import pygame
 import torch
 from pygame.locals import K_ESCAPE, K_SPACE, K_UP, KEYDOWN, QUIT
+
+import numpy as np
 
 from .entities import (
     Background,
@@ -47,60 +51,78 @@ class Flappy:
             eps_end=0.05,
             eps_dec=1e-4
         )
+        self.log_dir = Path("logs")
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.log_file = self.log_dir / "training_metrics.csv"
+        if not self.log_file.exists():
+            with self.log_file.open("w", newline="") as log_file:
+                writer = csv.writer(log_file)
+                writer.writerow(["episode", "total_reward", "average_loss", "epsilon"])
+        self.print_interval = 10
 
     async def start(self):
-        while True:
-            self.background = Background(self.config)
-            self.floor = Floor(self.config)
-            self.player = Player(self.config)
-            self.welcome_message = WelcomeMessage(self.config)
-            self.game_over_message = GameOver(self.config)
-            self.pipes = Pipes(self.config)
-            self.score = Score(self.config)
-            # await self.splash()
-            # await self.play()
-            await self.train()
-
-            # await self.game_over()
+        recent_rewards = []
+        for episode in range(1, self.num_episodes + 1):
+            self._reset_game()
+            total_reward, average_loss = await self.train()
+            self._log_episode(episode, total_reward, average_loss)
+            recent_rewards.append(total_reward)
+            if episode % self.print_interval == 0:
+                window = recent_rewards[-self.print_interval:]
+                avg_reward = sum(window) / len(window)
+                print(
+                    f"Episode {episode}: average reward {avg_reward:.2f}, "
+                    f"epsilon {self.agent.epsilon:.3f}"
+                )
 
     async def train(self):
         self.score.reset()
         self.player.set_mode(PlayerMode.NORMAL)
         done = False
-        observation = self.closest_entity()
-        reward = 0
+        observation = np.array(self.closest_entity(), dtype=np.float32)
+        total_reward = 0.0
+        total_loss = 0.0
+        loss_updates = 0
         flap_cooldown = 15  # 设置一个冷却时间，例如10帧
         flap_counter = 0  # 初始化冷却计数器
         while not done:
-            action = False
-            pipe_distance = observation[2]
+            for event in pygame.event.get():
+                self.check_quit_event(event)
+
+            action = 0
+            pipe_distance = max(abs(float(observation[2])), 1.0)
             if flap_counter == 0:
                 action = self.select_action(observation)
-                if action:  # 如果选择跳跃
+                if action == 1:  # 如果选择跳跃
                     self.player.flap()
                     flap_counter = flap_cooldown
             else:
                 flap_counter -= 1
-            crossed = False
-            for pipe in self.pipes.upper:
-                if self.player.crossed(pipe):
-                    crossed = True
-                    self.score.add()
-                    break
-            next_state = self.closest_entity()
+
+            crossed = any(self.player.crossed(pipe) for pipe in self.pipes.upper)
+            if crossed:
+                self.score.add()
+
+            next_state = np.array(self.closest_entity(), dtype=np.float32)
             done = self.player.collided(self.pipes, self.floor)
-            reward += 100 * crossed
 
-            if self.player.y > self.pipes.upper[0].rect.bottom or self.player.y < self.pipes.lower[0].rect.top:
-                reward -= 50/pipe_distance
-            else:
-                reward += 50/pipe_distance
+            step_reward = 100.0 if crossed else 0.0
+            if self.pipes.upper and self.pipes.lower:
+                upper_pipe = self.pipes.upper[0]
+                lower_pipe = self.pipes.lower[0]
+                if self.player.y > upper_pipe.rect.bottom or self.player.y < lower_pipe.rect.top:
+                    step_reward -= 50.0 / pipe_distance
+                else:
+                    step_reward += 50.0 / pipe_distance
+            if done:
+                step_reward -= 100.0
 
-            death_penalty = -100 * done
-            reward += death_penalty
-            print(reward)
-            self.agent.store_transition(observation, action, reward, next_state, done)
-            self.agent.learn()
+            total_reward += step_reward
+            self.agent.store_transition(observation, action, step_reward, next_state, done)
+            loss = self.agent.learn()
+            if loss is not None:
+                total_loss += loss
+                loss_updates += 1
 
             observation = next_state
 
@@ -113,6 +135,9 @@ class Flappy:
             pygame.display.update()
             await asyncio.sleep(0)
             self.config.tick()
+        average_loss = total_loss / loss_updates if loss_updates else 0.0
+        return total_reward, average_loss
+
     async def splash(self):
         """Shows welcome splash screen animation of flappy bird"""
 
@@ -237,6 +262,18 @@ class Flappy:
 
     def select_action(self, observation):
         state_tensor = torch.tensor(observation, dtype=torch.float32).to(self.agent.Q_eval.device)
-        action = self.agent.choose_action(state_tensor)
-        print(state_tensor)
-        return action
+        return self.agent.choose_action(state_tensor)
+
+    def _reset_game(self):
+        self.background = Background(self.config)
+        self.floor = Floor(self.config)
+        self.player = Player(self.config)
+        self.welcome_message = WelcomeMessage(self.config)
+        self.game_over_message = GameOver(self.config)
+        self.pipes = Pipes(self.config)
+        self.score = Score(self.config)
+
+    def _log_episode(self, episode, total_reward, average_loss):
+        with self.log_file.open("a", newline="") as log_file:
+            writer = csv.writer(log_file)
+            writer.writerow([episode, total_reward, average_loss, self.agent.epsilon])
