@@ -82,17 +82,19 @@ class Agent():
         self.mem_cntr += 1
 
     def choose_action(self, state):
-        if np.random.random() < self.epsilon:
-            print("random action")
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+
+        if np.random.random() > self.epsilon:
             actions = self.Q_eval.forward(state)
-            action = torch.argmax(actions).item()
+            action = torch.argmax(actions, dim=1).item()
         else:
             action = np.random.choice(self.action_space)
         return action
 
     def learn(self):
         if self.mem_cntr < self.batch_size:
-            return
+            return None
         self.Q_eval.optimizer.zero_grad()
         max_mem = min(self.mem_cntr, self.mem_size)
         batch = np.random.choice(max_mem, self.batch_size, replace=False)
@@ -115,3 +117,4 @@ class Agent():
         self.Q_eval.optimizer.step()
 
         self.epsilon = self.epsilon - self.eps_dec if self.epsilon > self.eps_min else self.eps_min
+        return loss.item()
